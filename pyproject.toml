@@ -1,14 +1,19 @@
 [project]
-name = "latin-texts-scrapping"
+name = "latinlibrary-scraper"
 version = "0.1.0"
-description = "Python app scaffolded from templates"
+description = "Scrape texts from The Latin Library using BeautifulSoup"
 readme = "README.md"
 requires-python = ">=3.10"
 
 dependencies = [
-    "python-dotenv",
-    "pytest"
+  "beautifulsoup4>=4.12",
+  "requests>=2.32",
+  "tqdm>=4.66",
+  "gradio>=4.41",
 ]
 
+[project.optional-dependencies]
+dev = ["ruff>=0.5.0"]
+
 [tool.uv]
-python = "3.11"
+# no special config needed, included so `uv` is happy
