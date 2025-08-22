@@ -1,0 +1,3 @@
+# This file is auto-generated from uv.lock for compatibility.
+# To update, run:
+#   uv export --format requirements-txt > requirements.txt

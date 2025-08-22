@@ -1,0 +1,25 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+
+# Environment files
+.env
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Test cache
+.pytest_cache/
+.mypy_cache/
+coverage/
+
+# Build artifacts
+dist/
+build/
+
+# uv lock at project root is kept, but ignore at higher dirs
