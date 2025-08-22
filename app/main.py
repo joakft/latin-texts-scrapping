@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .scraper_service import ScraperService
 
-# ---------- Default params ----------
+# ---------- Defaults ----------
 DEFAULT_URLS = "http://thelatinlibrary.com/"
 OUT_DIR = Path("./data")
 MAX_DEPTH = 3
@@ -14,16 +14,36 @@ DELAY = 2.0
 
 service = ScraperService()
 
+def _format_top_words(top_pairs):
+    return "\n".join(f"{w}: {c}" for w, c in top_pairs)
+
+def _format_top_files_md(items):
+    """
+    items: list of dicts {path, url, title, total_words, coverage}
+    Render as markdown with clickable local-file links.
+    """
+    if not items:
+        return "_No files yet meeting the threshold._"
+    lines = []
+    for d in items:
+        pct = f"{100.0 * d['coverage']:.1f}%"
+        # clickable local path (file://) and web URL
+        local = d["path"]
+        web = d["url"]
+        title = d["title"] or Path(local).name
+        lines.append(
+            f"- **{title}** — {pct} of words in top-500, total={d['total_words']:,}  "
+            f"[open file]({f'file://{local}'}) · [source]({web})"
+        )
+    return "\n".join(lines)
+
 def start_crawl(urls_text: str, max_depth: int, max_pages: int, delay: float):
     # stop any previous run
     service.stop()
-    # start a fresh service
     svc = ScraperService()
 
-    # parse URLs (comma/space/newline separated)
     urls = [u.strip() for u in urls_text.replace("\n", ",").split(",") if u.strip()]
 
-    # generator that streams tuples back to Gradio
     for snap in svc.run(
         start_urls=urls,
         out_dir=OUT_DIR,
@@ -32,10 +52,13 @@ def start_crawl(urls_text: str, max_depth: int, max_pages: int, delay: float):
         delay=delay,
         include_host_folder=(len(urls) > 1),
         heartbeat_every=10,
+        min_words_for_file=1000,    # your threshold
+        top_files_k=10,             # show top 10
+        top_vocab_n=500,            # rank by coverage of global top-500 words
     ):
-        top = snap.get("top_words", [])[:20]
-        # convert to displayable lines
-        top_str = "\n".join(f"{w}: {c}" for w, c in top)
+        # prepare UI payloads
+        top_words_txt = _format_top_words(snap.get("top_words", []))
+        top_files_md = _format_top_files_md(snap.get("top_files", []))
 
         yield (
             f"{snap.get('site','')}",
@@ -43,7 +66,8 @@ def start_crawl(urls_text: str, max_depth: int, max_pages: int, delay: float):
             int(snap.get("saved", 0)),
             int(snap.get("words_total", 0)),
             int(snap.get("vocab_size", 0)),
-            top_str,
+            top_words_txt,
+            top_files_md,
             snap.get("last_url", ""),
             snap.get("last_saved_path", ""),
             snap.get("note", ""),
@@ -81,7 +105,10 @@ with gr.Blocks(title="Latin Library Scraper") as demo:
         words_total_out = gr.Number(label="Total Words", interactive=False)
         vocab_size_out = gr.Number(label="Distinct Words", interactive=False)
 
-    top_words_out = gr.Textbox(label="Top Words (live)", lines=12, interactive=False)
+    with gr.Row():
+        top_words_out = gr.Textbox(label="Top Words (live)", lines=12, interactive=False)
+        top_files_out = gr.Markdown()  # <— the new widget with links
+
     last_url_out = gr.Textbox(label="Last URL", interactive=False)
     last_saved_out = gr.Textbox(label="Last Saved File", interactive=False)
     note_out = gr.Textbox(label="Note", interactive=False)
@@ -96,6 +123,7 @@ with gr.Blocks(title="Latin Library Scraper") as demo:
             words_total_out,
             vocab_size_out,
             top_words_out,
+            top_files_out,
             last_url_out,
             last_saved_out,
             note_out,

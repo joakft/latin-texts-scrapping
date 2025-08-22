@@ -95,7 +95,6 @@ def get_soup(url: str, session: requests.Session, *, retries: int = RETRIES, del
     for attempt in range(1, retries + 1):
         try:
             resp = session.get(url, timeout=REQUEST_TIMEOUT)
-            # Skip forbidden/too many/404 quietly
             if resp.status_code in (401, 403, 404, 429):
                 return None
             resp.raise_for_status()
@@ -137,19 +136,8 @@ def tokenize_count(text: str) -> Counter:
 class ScraperService:
     """
     Streamed BFS crawler that yields progress dicts for a UI to consume.
-    Yields dictionaries like:
-      {
-        "site": host,
-        "visited": int,
-        "saved": int,
-        "depth": int,
-        "queue": int,
-        "words_total": int,
-        "vocab_size": int,
-        "top_words": [("et", 1234), ("in", 1010), ...],
-        "last_url": "http://...",
-        "last_saved_path": "/abs/path/to/file.txt" or "",
-      }
+    Progress dict includes:
+      - 'top_files': list of {path, url, total_words, coverage, title}
     """
     def __init__(self):
         self._stop = False
@@ -166,11 +154,18 @@ class ScraperService:
         delay: float = 2.0,
         include_host_folder: bool = True,
         heartbeat_every: int = 10,
+        min_words_for_file: int = 1000,
+        top_files_k: int = 10,
+        top_vocab_n: int = 500,
     ) -> Generator[Dict, None, None]:
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        vocab = Counter()
+        # Global stats
+        global_vocab = Counter()
         words_total = 0
+
+        # Per-file stats: path -> dict(counter, total, url, title)
+        file_stats: Dict[str, Dict] = {}
 
         for start_url in start_urls:
             if self._stop:
@@ -183,7 +178,6 @@ class ScraperService:
 
             with make_session() as session:
                 working_base = None
-                # Try a few base variants to avoid 403s
                 for candidate in _alt_bases(base):
                     session.headers["Referer"] = candidate
                     soup = get_soup(candidate, session, delay=delay)
@@ -193,12 +187,7 @@ class ScraperService:
                     time.sleep(delay)
 
                 if not working_base:
-                    yield {
-                        "site": host, "visited": 0, "saved": 0, "depth": 0, "queue": 0,
-                        "words_total": words_total, "vocab_size": len(vocab),
-                        "top_words": vocab.most_common(20),
-                        "last_url": "", "last_saved_path": "", "note": "homepage unavailable"
-                    }
+                    yield self._snapshot(host, 0, 0, 0, 0, global_vocab, words_total, note="homepage unavailable")
                     continue
 
                 start = _strip_fragment(working_base)
@@ -206,8 +195,6 @@ class ScraperService:
 
                 visited: set[str] = set()
                 q = deque([(start, 0)])
-
-                # child -> (parent, anchor_text)
                 parent_map: Dict[str, Tuple[Optional[str], Optional[str]]] = {start: (None, None)}
 
                 visited_pages = 0
@@ -223,22 +210,15 @@ class ScraperService:
                     session.headers["Referer"] = parent_map.get(url, (None, None))[0] or working_base
                     soup = get_soup(url, session, delay=delay)
                     if soup is None:
-                        # heartbeat even if skipped to show liveness
                         if (visited_pages + len(visited)) % heartbeat_every == 0:
-                            yield {
-                                "site": host, "visited": visited_pages, "saved": saved_pages,
-                                "depth": depth, "queue": len(q),
-                                "words_total": words_total, "vocab_size": len(vocab),
-                                "top_words": vocab.most_common(20),
-                                "last_url": url, "last_saved_path": ""
-                            }
+                            yield self._snapshot(host, visited_pages, saved_pages, depth, len(q), global_vocab, words_total)
                         time.sleep(delay)
                         continue
 
-                    if is_html_like(url):
+                    if self._is_html_like(url):
                         visited_pages += 1
 
-                        # Build disk path reflecting anchor-chain levels (Y_html/X_html.txt)
+                        # Disk path via anchor-chain mirroring
                         chain = self._anchor_chain(url, parent_map)
                         if chain:
                             *dirs, leaf = chain
@@ -252,37 +232,44 @@ class ScraperService:
 
                         author, work = infer_titles(soup, url)
                         text = clean_text(soup)
-                        saved_path = ""
+                        saved_path_str = ""
                         if text and len(text) >= 80:
-                            # update running stats
                             c = tokenize_count(text)
-                            vocab.update(c)
+                            global_vocab.update(c)
                             words_total += sum(c.values())
 
-                            saved_path = str((target_dir / f"{safe_filename(leaf)}_html.txt").resolve())
+                            saved_path = target_dir / f"{safe_filename(leaf)}_html.txt"
                             header = f"# {work}\n# Author: {author}\n# Source: {url}\n\n"
-                            (target_dir / f"{safe_filename(leaf)}_html.txt").write_text(header + text, encoding="utf-8")
+                            saved_path.write_text(header + text, encoding="utf-8")
+                            saved_path_str = str(saved_path.resolve())
                             saved_pages += 1
 
-                        # stream progress
-                        if (visited_pages % heartbeat_every) == 0:
-                            yield {
-                                "site": host, "visited": visited_pages, "saved": saved_pages,
-                                "depth": depth, "queue": len(q),
-                                "words_total": words_total, "vocab_size": len(vocab),
-                                "top_words": vocab.most_common(20),
-                                "last_url": url, "last_saved_path": saved_path
+                            # store per-file stats
+                            file_stats[saved_path_str] = {
+                                "counter": c,
+                                "total": sum(c.values()),
+                                "url": url,
+                                "title": work,
                             }
 
+                        # heartbeat with top_files
+                        if (visited_pages % heartbeat_every) == 0:
+                            top_files = self._rank_top_files(file_stats, global_vocab, top_vocab_n, min_words_for_file, top_files_k)
+                            yield self._snapshot(
+                                host, visited_pages, saved_pages, depth, len(q),
+                                global_vocab, words_total,
+                                last_url=url, last_saved_path=saved_path_str,
+                                top_files=top_files
+                            )
+
                         if max_pages and visited_pages >= max_pages:
-                            yield {
-                                "site": host, "visited": visited_pages, "saved": saved_pages,
-                                "depth": depth, "queue": len(q),
-                                "words_total": words_total, "vocab_size": len(vocab),
-                                "top_words": vocab.most_common(20),
-                                "last_url": url, "last_saved_path": saved_path,
-                                "note": "reached page cap"
-                            }
+                            top_files = self._rank_top_files(file_stats, global_vocab, top_vocab_n, min_words_for_file, top_files_k)
+                            yield self._snapshot(
+                                host, visited_pages, saved_pages, depth, len(q),
+                                global_vocab, words_total,
+                                last_url=url, last_saved_path=saved_path_str,
+                                top_files=top_files, note="reached page cap"
+                            )
                             break
 
                     # enqueue children
@@ -292,7 +279,7 @@ class ScraperService:
                             if not href or EXCLUDE_RE.search(href):
                                 continue
                             nxt = _strip_fragment(urljoin(url, href))
-                            if not is_same_host(nxt, start):
+                            if urlparse(nxt).netloc.lower() != base_netloc.lower():
                                 continue
                             if nxt not in parent_map:
                                 anchor_text = (a.get_text(separator=" ", strip=True) or "").strip()
@@ -301,16 +288,63 @@ class ScraperService:
 
                     time.sleep(delay)
 
-                # final snapshot after a site finishes
-                yield {
-                    "site": host, "visited": visited_pages, "saved": saved_pages,
-                    "depth": 0, "queue": 0,
-                    "words_total": words_total, "vocab_size": len(vocab),
-                    "top_words": vocab.most_common(20),
-                    "last_url": "", "last_saved_path": "", "note": "site done"
-                }
+                # final snapshot for the site
+                top_files = self._rank_top_files(file_stats, global_vocab, top_vocab_n, min_words_for_file, top_files_k)
+                yield self._snapshot(host, visited_pages, saved_pages, 0, 0, global_vocab, words_total, top_files=top_files, note="site done")
 
-    # ------- small helpers for anchor-chain mirroring -------
+    # ------- helpers -------
+    def _snapshot(
+        self, site: str, visited: int, saved: int, depth: int, queue: int,
+        vocab: Counter, words_total: int, *,
+        last_url: str = "", last_saved_path: str = "", top_files: List[Dict] | None = None, note: str = ""
+    ) -> Dict:
+        return {
+            "site": site,
+            "visited": visited,
+            "saved": saved,
+            "depth": depth,
+            "queue": queue,
+            "words_total": words_total,
+            "vocab_size": len(vocab),
+            "top_words": vocab.most_common(20),
+            "last_url": last_url,
+            "last_saved_path": last_saved_path,
+            "top_files": top_files or [],
+            "note": note,
+        }
+
+    def _rank_top_files(
+        self,
+        file_stats: Dict[str, Dict],
+        global_vocab: Counter,
+        top_vocab_n: int,
+        min_words: int,
+        top_k: int,
+    ) -> List[Dict]:
+        if not file_stats:
+            return []
+
+        top_vocab = {w for w, _ in global_vocab.most_common(top_vocab_n)} if top_vocab_n > 0 else set()
+
+        scored = []
+        for path, st in file_stats.items():
+            total = st["total"]
+            if total < min_words:
+                continue
+            c: Counter = st["counter"]
+            in_top = sum(c[w] for w in top_vocab) if top_vocab else 0
+            coverage = (in_top / total) if total else 0.0
+            scored.append({
+                "path": path,
+                "url": st["url"],
+                "title": st.get("title") or "",
+                "total_words": total,
+                "coverage": coverage,
+            })
+
+        scored.sort(key=lambda d: d["coverage"], reverse=True)
+        return scored[:top_k]
+
     def _html_stem(self, page_url: str) -> str:
         p = urlparse(page_url).path
         if p.endswith("/") or p == "":
@@ -325,7 +359,6 @@ class ScraperService:
         while True:
             parent, anchor = parent_map.get(cur, (None, None))
             if parent is None:
-                # root reached, don't include it in chain
                 break
             seg = (anchor or self._html_stem(cur)).strip()
             seg = safe_filename(seg) or "page"
@@ -333,3 +366,6 @@ class ScraperService:
             cur = parent
         chain.reverse()
         return chain
+
+    def _is_html_like(self, url: str) -> bool:
+        return is_html_like(url)
